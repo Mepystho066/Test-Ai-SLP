@@ -1,0 +1,11 @@
+# Dependencias del Hito 0 (encoder de pose + smoke tests)
+# torch: instalar desde el índice CPU para no arrastrar CUDA en esta máquina
+#   uv pip install --index-url https://download.pytorch.org/whl/cpu torch
+torch>=2.1
+numpy>=1.24
+pyyaml>=6.0
+
+# NO se necesitan (y el fork los importa a nivel de módulo, se parchean con stubs
+# en smoke_test.py / train_smoke.py):
+#   tensorflow   -> solo para tf.nn.ctc_beam_search_decoder en el beam search conjunto
+#   torchtext    -> API legacy (torchtext.data.Dataset/Field), eliminada desde 0.9

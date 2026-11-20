@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MLSLT · cámara + features del modelo</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    color: var(--foreground);
+    font-family: var(--font-family, system-ui, sans-serif);
+    line-height: 1.45;
+  }
+  header { margin-bottom: 10px; }
+  h1 { font-size: 15px; margin: 0 0 2px; }
+  .sub { color: var(--muted-foreground); font-size: 12px; }
+  .stage { position: relative; width: 640px; max-width: 100%; }
+  #view {
+    display: block; width: 100%; height: auto;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: #000;
+  }
+  .controls { display: flex; align-items: center; gap: 10px; margin: 10px 0; flex-wrap: wrap; }
+  button {
+    background: var(--accent); color: #0b0b0d; border: none; border-radius: 6px;
+    padding: 7px 14px; font-weight: 600; cursor: pointer; font-size: 13px;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  button.secondary { background: transparent; color: var(--foreground); border: 1px solid var(--border); }
+  .pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border); }
+  .pill.ok { color: #22c55e; border-color: #22c55e55; }
+  .pill.warn { color: #eab308; border-color: #eab30855; }
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12px;
+  }
+  .panel h2 { font-size: 12px; margin: 0 0 6px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted-foreground); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+  .kv b { font-weight: 600; }
+  .kv .mono { font-family: ui-monospace, monospace; }
+  #fmap { display: block; width: 100%; height: auto; image-rendering: pixelated; border-radius: 4px; background: #111; }
+  #modelout { margin-top: 12px; }
+  .note { color: var(--muted-foreground); font-size: 11px; margin-top: 8px; }
+  code { font-family: ui-monospace, monospace; font-size: 11px; background: var(--card, #ffffff14); padding: 1px 4px; border-radius: 4px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>MLSLT — cámara → features del modelo (encoder de pose, contrato v0)</h1>
+    <div class="sub">MediaPipe Holistic-equivalente (pose + manos + cara) · 106 landmarks · 318 dim · normalización por hombros · T<sub>enc</sub> = 128</div>
+  </header>
+
+  <div class="stage">
+    <canvas id="view" width="640" height="480"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="btnCam">Activar cámara</button>
+    <button id="btnReset" class="secondary" disabled>Reiniciar buffer</button>
+    <button id="btnExport" class="secondary" disabled>Exportar features (.json)</button>
+    <button id="btnSend" class="secondary" disabled>Enviar al modelo</button>
+    <label class="pill"><input type="checkbox" id="autoSend" checked style="vertical-align:-1px"> auto-enviar</label>
+    <span id="status" class="pill warn">cámara apagada</span>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Métricas en vivo</h2>
+      <div class="kv" id="metrics">
+        <b>FPS</b><span class="mono" id="mFps">—</span>
+        <b>pose</b><span class="mono" id="mPose">—</span>
+        <b>mano izq</b><span class="mono" id="mHandL">—</span>
+        <b>mano der</b><span class="mono" id="mHandR">—</span>
+        <b>cara</b><span class="mono" id="mFace">—</span>
+        <b>buffer</b><span class="mono" id="mBuf">0 / 256</span>
+        <b>tensor</b><span class="mono" id="mTensor">—</span>
+        <b>max |x|</b><span class="mono" id="mMax">—</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Feature map (128 × 318) — lo que consume el modelo</h2>
+      <canvas id="fmap" width="318" height="128"></canvas>
+      <div class="note">Filas = pasos de tiempo (stride 2) · columnas = 318 dims (x,y,z por landmark). Azul = negativo, rojo = positivo.</div>
+    </div>
+  </div>
+
+  <div class="panel" id="modelout">
+    <h2>Salida del modelo</h2>
+    <div id="modelSentence" style="font-size:22px; font-weight:600; min-height:30px;">—</div>
+    <div id="modelText" style="margin-top:4px;">Modelo <b>sin entrenar</b>: la decodificación es real (beam atención+CTC sobre SentencePiece mT5), pero el texto no tendrá sentido hasta que exista un checkpoint. Arranca el servidor (<code>.venv/bin/python infer_server.py</code>) y abre <code>http://localhost:8000</code>.</div>
+  </div>
+
+  <script type="module">
+    import {
+      FaceLandmarker, FilesetResolver, HandLandmarker, PoseLandmarker
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0/vision_bundle.mjs";
+
+    // ---------- Contrato v0 (pose_contract.py) ----------
+    const N_HANDS = 42, N_ARMS = 14, N_LIPS = 40, N_BROWS = 10;
+    const N_POINTS = 106, DIM = 318;
+    const T_MAX = 256, STRIDE = 2, T_ENC = 128;
+    const SH_L = 42, SH_R = 43;            // hombros: pose 11/12 dentro del bloque de brazos
+    const FPS_TARGET = 25, SAMPLE_MS = 1000 / FPS_TARGET;
+
+    // Índices FaceMesh (468). El FaceLandmarker de Tasks devuelve 478 (añade iris
+    // en 468..477); usamos los primeros 468, que coinciden con Holistic.
+    const LIPS_OUTER = [61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
+    const LIPS_INNER = [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95];
+    const BROWS      = [70,63,105,66,107,336,296,334,293,300];
+
+    const POSE_CONNECTIONS = [
+      [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],[11,12],
+      [11,13],[13,15],[15,17],[15,19],[15,21],[17,19],[12,14],[14,16],[16,18],[16,20],[16,22],[18,20],
+      [11,23],[12,24],[23,24],[23,25],[25,27],[27,29],[29,31],[31,27],[24,26],[26,28],[28,30],[30,32],[32,28]
+    ];
+    const HAND_CONNECTIONS = [
+      [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+      [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]
+    ];
+
+    // ---------- DOM ----------
+    const view = document.getElementById("view");
+    const ctx = view.getContext("2d");
+    const fmap = document.getElementById("fmap");
+    const fctx = fmap.getContext("2d");
+    const btnCam = document.getElementById("btnCam");
+    const btnReset = document.getElementById("btnReset");
+    const btnExport = document.getElementById("btnExport");
+    const btnSend = document.getElementById("btnSend");
+    const autoSend = document.getElementById("autoSend");
+    const statusEl = document.getElementById("status");
+
+    const $ = id => document.getElementById(id);
+
+    let video = null, stream = null;
+    let poseLM = null, handLM = null, faceLM = null;
+    let running = false, raf = 0;
+    let buffer = [];                 // Float32Array(318) por frame muestreado (máx T_MAX)
+    let sending = false;             // evita reenviar el mismo buffer en auto-envío
+    let lastFrame = null;            // últimos landmarks (para dibujar)
+    let lastSample = 0;
+    let fps = 0, fpsCount = 0, fpsT0 = performance.now();
+    const METRIC = {
+      pose: "—", handL: "—", handR: "—", face: "—"
+    };
+
+    // ---------- MediaPipe ----------
+    async function initModels() {
+      statusEl.textContent = "cargando modelos MediaPipe…";
+      statusEl.className = "pill warn";
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0/wasm"
+      );
+      poseLM = await PoseLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", delegate: "GPU" },
+        runningMode: "VIDEO", numPoses: 1, minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5
+      });
+      handLM = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
+        runningMode: "VIDEO", numHands: 2
+      });
+      faceLM = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate: "GPU" },
+        runningMode: "VIDEO", outputFaceBlendshapes: false, numFaces: 1
+      });
+      statusEl.textContent = "modelos listos";
+      statusEl.className = "pill ok";
+    }
+
+    async function start() {
+      btnCam.disabled = true;
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error("getUserMedia no disponible aquí: abre este HTML en tu navegador (o sírvelo en localhost) para usar la cámara.");
+        }
+        stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: "user" }, audio: false });
+        if (!video) {
+          video = document.createElement("video");
+          video.setAttribute("playsinline", "");
+          video.muted = true;              // sin pista de audio: evita el bloqueo de autoplay
+          video.style.display = "none";    // oculto pero DENTRO del DOM
+          document.body.appendChild(video); // play() falla con "media removed from the document" si no está adjunto
+        }
+        video.srcObject = stream;
+        try {
+          await video.play();
+        } catch (perr) {
+          throw new Error("no se pudo iniciar el vídeo: " + perr.message);
+        }
+        if (!poseLM) await initModels();
+        running = true;
+        btnReset.disabled = false;
+        statusEl.textContent = "activo";
+        statusEl.className = "pill ok";
+        lastSample = performance.now();
+        loop();
+      } catch (e) {
+        statusEl.textContent = "error: " + e.message;
+        statusEl.className = "pill warn";
+        btnCam.disabled = false;
+      }
+    }
+
+    function detect(tMs) {
+      const pose = poseLM.detectForVideo(video, tMs);
+      const hand = handLM.detectForVideo(video, tMs);
+      const face = faceLM.detectForVideo(video, tMs);
+
+      const poseLm = pose.landmarks && pose.landmarks[0] ? pose.landmarks[0] : null;
+      const faceLm = face.faceLandmarks && face.faceLandmarks[0] ? face.faceLandmarks[0] : null;
+      let left = null, right = null;
+      if (hand.landmarks) {
+        hand.landmarks.forEach((lm, i) => {
+          const h = hand.handedness && hand.handedness[i] && hand.handedness[i][0];
+          const name = h ? h.categoryName : null;
+          if (name === "Left") left = lm;
+          else if (name === "Right") right = lm;
+          else if (!left) left = lm;   // sin handedness, primera mano al slot izq
+          else if (!right) right = lm;
+        });
+      }
+
+      METRIC.pose = poseLm ? poseLm.length : 0;
+      METRIC.handL = left ? left.length : 0;
+      METRIC.handR = right ? right.length : 0;
+      METRIC.face = faceLm ? faceLm.length : 0;
+
+      lastFrame = { pose: poseLm, left, right, face: faceLm };
+      return buildFeatures(poseLm, left, right, faceLm);
+    }
+
+    function buildFeatures(pose, left, right, face) {
+      const pts = new Array(N_POINTS);
+      for (let i = 0; i < N_POINTS; i++) pts[i] = [0, 0, 0];
+      // manos (izq 0..20, der 21..41)
+      for (let k = 0; k < 21; k++) {
+        if (left)  pts[k]      = [left[k].x,  left[k].y,  left[k].z];
+        if (right) pts[21 + k] = [right[k].x, right[k].y, right[k].z];
+      }
+      // brazos/torso: pose 11..24
+      if (pose && pose.length >= 25) {
+        for (let k = 11; k <= 24; k++) pts[N_HANDS + (k - 11)] = [pose[k].x, pose[k].y, pose[k].z];
+      }
+      // labios 40 + cejas 10
+      if (face && face.length >= 468) {
+        for (let i = 0; i < 20; i++) { const j = LIPS_OUTER[i]; pts[N_HANDS + N_ARMS + i]      = [face[j].x, face[j].y, face[j].z]; }
+        for (let i = 0; i < 20; i++) { const j = LIPS_INNER[i]; pts[N_HANDS + N_ARMS + 20 + i] = [face[j].x, face[j].y, face[j].z]; }
+        for (let i = 0; i < 10; i++) { const j = BROWS[i]; pts[N_HANDS + N_ARMS + N_LIPS + i]  = [face[j].x, face[j].y, face[j].z]; }
+      }
+      // normalización por hombros (pose_contract.py normalize_sequence)
+      const shl = pts[SH_L], shr = pts[SH_R];
+      const cx = (shl[0] + shr[0]) / 2, cy = (shl[1] + shr[1]) / 2, cz = (shl[2] + shr[2]) / 2;
+      let w = Math.hypot(shl[0] - shr[0], shl[1] - shr[1], shl[2] - shr[2]);
+      if (w < 1e-3) w = 1e-3;
+      const out = new Float32Array(DIM);
+      for (let i = 0; i < N_POINTS; i++) {
+        out[i * 3]     = (pts[i][0] - cx) / w;
+        out[i * 3 + 1] = (pts[i][1] - cy) / w;
+        out[i * 3 + 2] = (pts[i][2] - cz) / w;
+      }
+      return out;
+    }
+
+    // ---------- Loop ----------
+    function loop() {
+      if (!running) return;
+      raf = requestAnimationFrame(loop);
+      const now = performance.now();
+      fpsCount++; if (now - fpsT0 >= 1000) { fps = fpsCount; fpsCount = 0; fpsT0 = now; }
+      if (video.readyState >= 2) {
+        const tMs = performance.now();
+        if (now - lastSample >= SAMPLE_MS) {
+          lastSample = now;
+          const feats = detect(tMs);
+          if (buffer.length < T_MAX) {
+            buffer.push(feats);
+          }
+        } else {
+          // re-detect para dibujar overlay sin añadir al buffer (solo si aún no hay frame)
+          if (!lastFrame) detect(tMs);
+        }
+      }
+      draw();
+      updateMetrics();
+    }
+
+    function draw() {
+      const W = view.width, H = view.height;
+      ctx.save();
+      ctx.clearRect(0, 0, W, H);
+      if (video && video.readyState >= 2) {
+        // espejo para que sea natural (solo visual; los features NO se espejan)
+        ctx.translate(W, 0); ctx.scale(-1, 1);
+        ctx.drawImage(video, 0, 0, W, H);
+      }
+      if (lastFrame) {
+        const { pose, left, right, face } = lastFrame;
+        ctx.lineWidth = 2; ctx.strokeStyle = "#22d3ee";
+        if (pose) drawConnections(pose, POSE_CONNECTIONS, "#22d3ee");
+        ctx.strokeStyle = "#f472b6";
+        if (left)  drawConnections(left, HAND_CONNECTIONS, "#f472b6");
+        if (right) drawConnections(right, HAND_CONNECTIONS, "#fbbf24");
+        if (face && face.length >= 468) {
+          ctx.fillStyle = "#a3e635";
+          for (const j of [...LIPS_OUTER, ...LIPS_INNER, ...BROWS]) {
+            dot(face[j]);
+          }
+        }
+      }
+      ctx.restore();
+    }
+
+    function drawConnections(lm, conns, color) {
+      ctx.strokeStyle = color; ctx.fillStyle = color;
+      for (const [a, b] of conns) {
+        ctx.beginPath();
+        ctx.moveTo(lm[a].x * view.width, lm[a].y * view.height);
+        ctx.lineTo(lm[b].x * view.width, lm[b].y * view.height);
+        ctx.stroke();
+      }
+      for (const p of lm) dot(p);
+    }
+    function dot(p) {
+      ctx.fillRect(p.x * view.width - 1.5, p.y * view.height - 1.5, 3, 3);
+    }
+
+    // ---------- Métricas + feature map ----------
+    function updateMetrics() {
+      $("mFps").textContent = fps;
+      $("mPose").textContent = METRIC.pose;
+      $("mHandL").textContent = METRIC.handL;
+      $("mHandR").textContent = METRIC.handR;
+      $("mFace").textContent = METRIC.face;
+      $("mBuf").textContent = buffer.length + " / " + T_MAX;
+      const rows = Math.min(T_ENC, Math.floor(buffer.length / STRIDE));
+      let maxAbs = 0;
+      for (let i = 0; i < rows; i++) {
+        const f = buffer[i * STRIDE];
+        for (let j = 0; j < DIM; j++) { const a = Math.abs(f[j]); if (a > maxAbs) maxAbs = a; }
+      }
+      $("mMax").textContent = maxAbs ? maxAbs.toFixed(3) : "—";
+      $("mTensor").textContent = rows > 0 ? rows + " × " + DIM : "—";
+      btnExport.disabled = rows < T_ENC;
+      btnSend.disabled = rows < T_ENC;
+      if (rows >= T_ENC && autoSend.checked && !sending) {
+        sending = true;
+        sendFeatures();
+      }
+      drawFeatureMap(rows, maxAbs);
+    }
+
+    async function sendFeatures() {
+      const rows = Math.min(T_ENC, Math.floor(buffer.length / STRIDE));
+      const data = [];
+      for (let i = 0; i < rows; i++) data.push(Array.from(buffer[i * STRIDE]));
+      $("modelSentence").textContent = "…";
+      $("modelText").textContent = "enviando " + rows + " × " + DIM + " al modelo…";
+      try {
+        const r = await fetch("/predict", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ data, shape: [rows, DIM] })
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || JSON.stringify(j));
+        if (j.sign) {
+          const pct = (j.confidence * 100).toFixed(0);
+          $("modelSentence").textContent = j.sign + " · " + pct + "%";
+          const top = (j.top3 || []).map(t => t.sign + " " + (t.p * 100).toFixed(0) + "%").join("  ·  ");
+          $("modelText").textContent = top + " · " + (j.ms || 0) + " ms";
+        } else {
+          $("modelSentence").textContent = j.text || "(vacío)";
+          $("modelText").textContent = (j.note || "sin clasificador")
+            + " · " + (j.ms || 0) + " ms";
+        }
+      } catch (e) {
+        $("modelSentence").textContent = "sin backend";
+        $("modelText").textContent = "No se pudo conectar: " + e.message
+          + " (¿arrancaste `infer_server.py` y abriste http://localhost:8000?)";
+      } finally {
+        buffer = [];   // ventana deslizante: prepara la siguiente frase
+        sending = false;
+      }
+    }
+
+    function drawFeatureMap(rows, maxAbs) {
+      fctx.fillStyle = "#0b0b0d";
+      fctx.fillRect(0, 0, fmap.width, fmap.height);
+      const scale = maxAbs > 0 ? 1 / maxAbs : 1;
+      const img = fctx.createImageData(fmap.width, fmap.height);
+      for (let y = 0; y < fmap.height; y++) {
+        const f = buffer[Math.min(y * STRIDE, buffer.length - 1)] || new Float32Array(DIM);
+        for (let x = 0; x < fmap.width; x++) {
+          const v = Math.max(-1, Math.min(1, f[x] * scale));
+          const [r, g, b] = colormap(v);
+          const o = (y * fmap.width + x) * 4;
+          img.data[o] = r; img.data[o + 1] = g; img.data[o + 2] = b; img.data[o + 3] = 255;
+        }
+      }
+      fctx.putImageData(img, 0, 0);
+    }
+    function colormap(v) { // -1 azul → 0 gris → +1 rojo
+      if (v < 0) { const t = -v; return [Math.round(80 + 40 * t), Math.round(90 + 40 * t), Math.round(220 + 35 * t)]; }
+      const t = v; return [Math.round(220 + 35 * t), Math.round(90 + 40 * (1 - t)), Math.round(80 + 40 * (1 - t))];
+    }
+
+    // ---------- Export ----------
+    function exportFeatures() {
+      const rows = Math.min(T_ENC, Math.floor(buffer.length / STRIDE));
+      const data = [];
+      for (let i = 0; i < rows; i++) data.push(Array.from(buffer[i * STRIDE]));
+      const payload = JSON.stringify({ shape: [rows, DIM], sample_rate_note: "stride 2 sobre ~25fps", data });
+      const blob = new Blob([payload], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "features.json";
+      a.click();
+      URL.revokeObjectURL(a.href);
+      $("modelText").innerHTML = "Exportado <code>features.json</code>. Cárgalo en Python con: <code>np.array(json.load(open('features.json'))['data'], dtype='float32').reshape((128, 318))</code>";
+    }
+
+    btnCam.addEventListener("click", start);
+    btnReset.addEventListener("click", () => { buffer = []; $("mBuf").textContent = "0 / 256"; });
+    btnExport.addEventListener("click", exportFeatures);
+    btnSend.addEventListener("click", () => { if (!sending) { sending = true; sendFeatures(); } });
+  </script>
+</body>
+</html>

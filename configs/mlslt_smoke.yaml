@@ -1,0 +1,80 @@
+# Hito 0 — config mínimo del fork Tan et al. (SignJoey) con encoder de pose.
+# Contrato del encoder (acordado 2026-10-30): MediaPipe Holistic, 106 landmarks
+# (manos 42 + brazos/torso 14 + labios 40 + cejas 10) = 318 dim (x,y,z, crudo).
+# 256 frames @25fps, stride 2 -> T_enc = 128.
+#
+# ADVERTENCIA: el data loader del fork (dataset.py) está hardcodeado a CSL-Daily
+# (.npy con original_info/label_char + features slowfast). El smoke test
+# (smoke_test.py) NO pasa por data.py: construye el Batch directamente sobre
+# tensores sintéticos. Este bloque `data` documenta los valores del contrato
+# y queda listo para cuando se reescriba el loader.
+
+name: mlslt_smoke
+
+data:
+  feature_size: 318          # 106 landmarks x (x,y,z)
+  data_path: ./data
+  train: train.npy
+  dev: dev.npy
+  test: test.npy
+  level: word                # word | bpe | char  (bpe para el vocab multilingüe)
+  txt_lowercase: true
+  max_sent_length: 160       # longitud de la frase hablada (no confundir con T_enc=128)
+  gls_voc_limit: 1000
+  # Vocab recortado de mT5: 64 000 piezas + 4 reservados -> la cabeza CTC tiene
+  # 64004 clases (ver pose_vocab.py). El .map.json ya declara `ctc_vocab_size: 64004`.
+  txt_voc_limit: 64004
+  txt_vocab_model: ../vocab/mt5_trimmed_64000.model
+  txt_vocab_map: ../vocab/mt5_trimmed_64000.map.json
+
+model:
+  # tied_softmax=true comparte embedding de salida y de entrada: con 64004 clases
+  # ahorra 16,4 M params (55,1 M -> 38,7 M con 2+2 capas; 50,3 M con 6+6).
+  tied_softmax: true
+  # Sign2LID (paper §3.2): CTC de identificación de lengua de señas sobre la
+  # capa inicial del encoder. lid_vocab_size = N lenguas + 1 (blank).
+  lid_vocab_size: 4
+  encoder:
+    type: transformer
+    hidden_size: 256         # debe == embeddings.embedding_dim (model.py:474-477)
+    ff_size: 2048
+    num_layers: 6
+    num_heads: 8
+    dropout: 0.1
+    embeddings:
+      embedding_dim: 256
+      dropout: 0.1
+      scale: true
+  decoder:
+    type: transformer
+    hidden_size: 256
+    ff_size: 2048
+    num_layers: 6
+    num_heads: 8
+    dropout: 0.1
+    embeddings:
+      embedding_dim: 256
+      dropout: 0.1
+      scale: true
+
+training:
+  model_dir: ./models/mlslt_smoke
+  random_seed: 42
+  epochs: 1
+  batch_size: 2
+  learning_rate: 1.0e-3
+  optimizer: adam
+  scheduling: plateau
+  decrease_factor: 0.5
+  patience: 5
+  clip_grad_norm: 1.0
+  use_cuda: false
+  # Pesos de pérdida del paper (LID λ1=1, TxtCTC λ2=5, atención λ3=3).
+  # recognition = CTC de glosa (legacy del fork), joint = TxtCTC,
+  # translation = atención (decoder autorregresivo), lid = Sign2LID.
+  recognition_loss_weight: 1.0
+  joint_loss_weight: 5.0        # TxtCTC
+  translation_loss_weight: 3.0  # atención
+  lid_loss_weight: 1.0          # λ1 del paper (Sign2LID)
+  eval_metric: bleu
+  early_stopping_metric: eval_metric
